@@ -1,0 +1,23 @@
+[project]
+name = "kiln-reference"
+version = "0.1.0"
+description = "Dev-only: generates reference fixtures (token ids, logits) for Kiln's tests from HF tokenizers/transformers."
+requires-python = ">=3.11"
+dependencies = [
+    "tokenizers>=0.20",
+    "transformers>=4.45",
+    "torch>=2.4",
+    "safetensors>=0.4",
+    "numpy>=1.26",
+]
+
+[tool.uv]
+package = false
+
+[tool.uv.sources]
+torch = { index = "pytorch-cpu" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
