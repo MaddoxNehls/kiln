@@ -8,7 +8,9 @@ use clap::{Args, Parser, Subcommand};
 use kiln::chat::{ChatTemplate, Message, Role};
 use kiln::generate::{Generation, Session, StopReason};
 use kiln::model::Model;
+use kiln::perplexity;
 use kiln::sampler::{Sampler, SamplingParams};
+use kiln::tensor::Quant;
 use kiln::tokenizer::{TokenId, Tokenizer};
 
 #[derive(Parser)]
@@ -23,7 +25,9 @@ enum Command {
     /// Generate a single completion and stream it to stdout.
     Generate {
         #[command(flatten)]
-        common: CommonArgs,
+        model: ModelArgs,
+        #[command(flatten)]
+        args: GenerationArgs,
         #[arg(long)]
         prompt: String,
         /// Feed the prompt as-is instead of wrapping it in the chat template.
@@ -33,15 +37,41 @@ enum Command {
     /// Interactive multi-turn chat.
     Chat {
         #[command(flatten)]
-        common: CommonArgs,
+        model: ModelArgs,
+        #[command(flatten)]
+        args: GenerationArgs,
+    },
+    /// Perplexity of a text file (e.g. WikiText-2 test, see scripts/download-wikitext.sh).
+    Perplexity {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[arg(long, default_value = "data/wikitext-2-raw/wiki.test.raw")]
+        file: PathBuf,
+        /// Tokens per evaluation window (windows do not overlap).
+        #[arg(long, default_value_t = 512)]
+        ctx: usize,
+        /// Number of windows to evaluate.
+        #[arg(long, default_value_t = 40)]
+        windows: usize,
     },
 }
 
 #[derive(Args)]
-struct CommonArgs {
+struct ModelArgs {
     /// Directory with config.json, tokenizer.json, tokenizer_config.json, model.safetensors.
     #[arg(long, default_value = "models/smollm2-135m-instruct")]
     model: PathBuf,
+    /// Weight format, quantized at load time: f32, q8 (int8 per row), q4 (4-bit,
+    /// groups of 32) or q4g<N> (groups of N).
+    #[arg(long, default_value = "f32")]
+    quant: Quant,
+    /// Worker threads (default: all logical cores).
+    #[arg(long)]
+    threads: Option<usize>,
+}
+
+#[derive(Args)]
+struct GenerationArgs {
     #[arg(long, default_value_t = 256)]
     max_tokens: usize,
     /// 0 = greedy.
@@ -65,12 +95,9 @@ struct CommonArgs {
     /// KV cache capacity in tokens.
     #[arg(long, default_value_t = 2048)]
     ctx: usize,
-    /// Worker threads (default: all cores).
-    #[arg(long)]
-    threads: Option<usize>,
 }
 
-impl CommonArgs {
+impl GenerationArgs {
     fn sampling(&self) -> SamplingParams {
         let seed = self.seed.unwrap_or_else(|| {
             std::time::SystemTime::now()
@@ -97,23 +124,32 @@ struct Engine {
 }
 
 impl Engine {
-    fn load(dir: &Path) -> Result<Self> {
+    fn load(args: &ModelArgs) -> Result<Self> {
+        if let Some(n) = args.threads {
+            rayon::ThreadPoolBuilder::new()
+                .num_threads(n)
+                .build_global()
+                .context("configuring thread pool")?;
+        }
+        let dir: &Path = &args.model;
         let t0 = Instant::now();
         let tokenizer = Tokenizer::from_file(dir.join("tokenizer.json"))?;
         let template = ChatTemplate::from_tokenizer_config(dir.join("tokenizer_config.json"))?;
-        let model =
-            Model::load(dir).with_context(|| format!("loading model from {}", dir.display()))?;
+        let model = Model::load_quantized(dir, args.quant)
+            .with_context(|| format!("loading model from {}", dir.display()))?;
         let mut stop_tokens = model.config().eos_token_ids();
         stop_tokens.extend(tokenizer.token_id(template.end_of_turn()));
         stop_tokens.extend(tokenizer.token_id("<|endoftext|>"));
         let c = model.config();
         eprintln!(
-            "loaded {} ({} layers, d={}, {}q/{}kv heads) in {:.2}s on {} threads",
+            "loaded {} ({} layers, d={}, {}q/{}kv heads) as {}: {:.1} MB of weights, {:.2}s, {} threads",
             dir.display(),
             c.num_hidden_layers,
             c.hidden_size,
             c.num_attention_heads,
             c.num_kv_heads(),
+            model.quant(),
+            model.weight_bytes() as f64 / 1e6,
             t0.elapsed().as_secs_f64(),
             rayon::current_num_threads()
         );
@@ -185,66 +221,99 @@ fn report(g: &Generation) {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
-    let common = match &cli.command {
-        Command::Generate { common, .. } | Command::Chat { common } => common,
-    };
-    if let Some(n) = common.threads {
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(n)
-            .build_global()
-            .context("configuring thread pool")?;
-    }
-    let engine = Engine::load(&common.model)?;
-    let mut sampler = Sampler::new(common.sampling());
-    let mut session = Session::new(&engine.model, common.ctx);
-
-    match &cli.command {
-        Command::Generate { prompt, raw, .. } => {
-            let text = if *raw {
-                prompt.clone()
+    match Cli::parse().command {
+        Command::Generate {
+            model,
+            args,
+            prompt,
+            raw,
+        } => {
+            let engine = Engine::load(&model)?;
+            let mut sampler = Sampler::new(args.sampling());
+            let mut session = Session::new(&engine.model, args.ctx);
+            let text = if raw {
+                prompt
             } else {
-                let mut messages = engine.conversation_start(common.system.as_deref());
-                messages.push(Message::new(Role::User, prompt.as_str()));
+                let mut messages = engine.conversation_start(args.system.as_deref());
+                messages.push(Message::new(Role::User, prompt));
                 engine.template.render(&messages, true)
             };
             let ids = engine.tokenizer.encode(&text);
             let (generation, _) =
-                engine.stream(&mut session, &ids, common.max_tokens, &mut sampler)?;
+                engine.stream(&mut session, &ids, args.max_tokens, &mut sampler)?;
             report(&generation);
         }
-        Command::Chat { .. } => {
-            eprintln!("chat mode: empty line or Ctrl-Z/Ctrl-D to quit, /reset to clear history");
-            let mut messages = engine.conversation_start(common.system.as_deref());
-            let stdin = io::stdin();
-            loop {
-                eprint!("\n> ");
-                io::stderr().flush()?;
-                let mut line = String::new();
-                if stdin.lock().read_line(&mut line)? == 0 || line.trim().is_empty() {
-                    break;
-                }
-                if line.trim() == "/reset" {
-                    messages = engine.conversation_start(common.system.as_deref());
-                    continue;
-                }
-                messages.push(Message::new(Role::User, line.trim_end()));
-                // Re-render the whole conversation; the session reuses the
-                // cached prefix, so only the new turn is actually computed.
-                let ids = engine
-                    .tokenizer
-                    .encode(&engine.template.render(&messages, true));
-                if ids.len() >= session.capacity() {
-                    eprintln!("[context full; use /reset]");
-                    messages.pop();
-                    continue;
-                }
-                let (generation, reply) =
-                    engine.stream(&mut session, &ids, common.max_tokens, &mut sampler)?;
-                report(&generation);
-                messages.push(Message::new(Role::Assistant, reply.trim_end()));
-            }
+        Command::Chat { model, args } => {
+            let engine = Engine::load(&model)?;
+            chat(&engine, &args)?;
+        }
+        Command::Perplexity {
+            model,
+            file,
+            ctx,
+            windows,
+        } => {
+            let engine = Engine::load(&model)?;
+            let text = std::fs::read_to_string(&file).with_context(|| {
+                format!(
+                    "reading {} (run scripts/download-wikitext.sh)",
+                    file.display()
+                )
+            })?;
+            let tokens = engine.tokenizer.encode(&text);
+            eprintln!(
+                "{} tokens; scoring {windows} windows of {ctx}",
+                tokens.len()
+            );
+            let t0 = Instant::now();
+            let result = perplexity::evaluate(&engine.model, &tokens, ctx, windows, |p| {
+                eprint!("\r  window {:>3}: ppl {:.4}", p.windows, p.ppl());
+            })?;
+            eprintln!();
+            println!(
+                "{}: perplexity {:.4} over {} tokens ({} windows × {ctx}) in {:.1}s",
+                engine.model.quant(),
+                result.ppl(),
+                result.scored_tokens,
+                result.windows,
+                t0.elapsed().as_secs_f64()
+            );
         }
     }
     Ok(())
+}
+
+fn chat(engine: &Engine, args: &GenerationArgs) -> Result<()> {
+    let mut sampler = Sampler::new(args.sampling());
+    let mut session = Session::new(&engine.model, args.ctx);
+    eprintln!("chat mode: empty line or Ctrl-Z/Ctrl-D to quit, /reset to clear history");
+    let mut messages = engine.conversation_start(args.system.as_deref());
+    let stdin = io::stdin();
+    loop {
+        eprint!("\n> ");
+        io::stderr().flush()?;
+        let mut line = String::new();
+        if stdin.lock().read_line(&mut line)? == 0 || line.trim().is_empty() {
+            return Ok(());
+        }
+        if line.trim() == "/reset" {
+            messages = engine.conversation_start(args.system.as_deref());
+            continue;
+        }
+        messages.push(Message::new(Role::User, line.trim_end()));
+        // Re-render the whole conversation; the session reuses the cached
+        // prefix, so only the new turn is actually computed.
+        let ids = engine
+            .tokenizer
+            .encode(&engine.template.render(&messages, true));
+        if ids.len() >= session.capacity() {
+            eprintln!("[context full; use /reset]");
+            messages.pop();
+            continue;
+        }
+        let (generation, reply) =
+            engine.stream(&mut session, &ids, args.max_tokens, &mut sampler)?;
+        report(&generation);
+        messages.push(Message::new(Role::Assistant, reply.trim_end()));
+    }
 }

@@ -6,17 +6,19 @@ on the CPU, with no ML or tensor framework: the tokenizer, the transformer math,
 the KV cache and the sampler are all implemented here and checked against
 Hugging Face `tokenizers`/`transformers`.
 
-> Status: milestones 1-3 of [`docs/spec.md`](docs/spec.md) are done (tokenizer,
-> fp32 forward pass, KV cache + sampling + streaming CLI). Performance work,
-> quantization and the HTTP server are next.
+> Status: milestones 1-5 of [`docs/spec.md`](docs/spec.md) are done: the
+> tokenizer, the fp32 forward pass, the KV cache with sampling and a streaming
+> CLI, AVX2 kernels with a performance log, and int8/int4 quantization with a
+> perplexity table. The HTTP server (milestone 6) is next.
 
 ```console
-$ kiln generate --prompt "Explain in two sentences why the sky is blue." --max-tokens 100 --seed 42
-loaded models/smollm2-135m-instruct (30 layers, d=576, 9q/3kv heads) in 0.13s on 16 threads
+$ kiln generate --quant q8 --threads 8 --prompt "Explain in two sentences why the sky is blue." --max-tokens 100 --seed 42
+loaded models/smollm2-135m-instruct (30 layers, d=576, 9q/3kv heads) as q8: 135.4 MB of weights, 0.28s, 8 threads
 The sky appears blue because the Earth's atmosphere scatters sunlight in all directions,
-including blue light. As the sun moves across the sky during sunrise or sunset, different
-wavelengths of light are scattered at varying rates by the atmosphere. ...
-[prefill 40 tok in 101 ms = 397.1 tok/s | decode 99 tok in 1751 ms = 56.5 tok/s | max tokens]
+including blue light. This scattering occurs because the molecules of gases like oxygen and
+nitrogen absorb shorter wavelengths of light (blue) more efficiently than longer wavelengths
+(red). As a result, blue light is scattered out to one side, giving the sky its characteristic blue color.
+[prefill 40 tok in 60 ms = 664.2 tok/s | decode 69 tok in 204 ms = 339.0 tok/s | stop token]
 ```
 
 ## Quick start
@@ -25,14 +27,20 @@ wavelengths of light are scattered at varying rates by the atmosphere. ...
 scripts/download-model.sh                 # ~270 MB into models/smollm2-135m-instruct/
 cargo build --release
 ./target/release/kiln generate --prompt "Write a haiku about Rust." --max-tokens 64
-./target/release/kiln chat                # multi-turn; /reset clears history
+./target/release/kiln chat --quant q8     # multi-turn; /reset clears history
+scripts/download-wikitext.sh              # WikiText-2 test split into data/
+./target/release/kiln perplexity --quant q4
 cargo test                                # needs the downloaded model
+cargo bench --bench e2e                   # KILN_QUANT=q8|q4, RAYON_NUM_THREADS=N
 ```
 
+Every command takes `--quant f32|q8|q4` (weights are quantized at load time
+from the bf16 checkpoint; `q4g64` selects 64-weight groups) and `--threads`.
 Sampling flags (shared by `generate` and `chat`): `--temperature` (0 = greedy),
 `--top-k`, `--top-p`, `--repeat-penalty`, `--repeat-last-n`, `--seed`. Also
-`--system`, `--ctx` (KV cache size), `--threads`, and `--raw` on `generate` to
-skip the chat template.
+`--system`, `--ctx` (KV cache size), and `--raw` on `generate` to skip the chat
+template. On this 8-core CPU, `--threads 8` beats the default of 16 logical
+threads for decode.
 
 ## Architecture
 
@@ -55,7 +63,9 @@ skip the chat template.
 
 | Module | Role |
 |---|---|
-| `tensor` | `Matrix` and `matmul`, the one compute hot spot and the boundary where SIMD and quantized weights will plug in |
+| `tensor` | `Matrix` (f32 / q8 / q4 storage) and `matmul`: work partitioning, cache-blocked prefill tiles, decode mat-vecs |
+| `tensor::kernels` | scalar and AVX2+FMA kernels (`dot`, 4×3 `tile`, `dot_q8`, `dot_q4_q8`), chosen at runtime |
+| `tensor::quant` | int8 per-row and 4-bit group formats, activation quantization |
 | `ops` | RMSNorm, softmax, SwiGLU, RoPE tables |
 | `weights` | memory-mapped safetensors, bf16/f16 → f32 widening, shape checks |
 | `model` | the Llama forward pass, batched over a whole prompt |
@@ -64,6 +74,7 @@ skip the chat template.
 | `sampler` | greedy / temperature / top-k / top-p / repetition penalty, seedable SplitMix64 |
 | `chat` | ChatML template, checked against `apply_chat_template` |
 | `generate` | `Session`: prefill, decode loop, stop conditions, timing |
+| `perplexity` | fixed-protocol WikiText-2 perplexity, matched against transformers |
 
 **One crate, library + binary.** Every module is a stage of a single pipeline with
 one consumer, so a workspace would add manifests without adding any boundary that
@@ -79,12 +90,12 @@ tokens as one `[n, hidden]` batch (the whole prompt at prefill, one token per de
 |---|---|
 | `x = E[tokens]` | rows of `embed` copied into `x` |
 | `h = RMSNorm(x) = x / sqrt(mean(x²) + ε) · g` | `ops::rms_norm` |
-| `q, k, v = h·Wqᵀ, h·Wkᵀ, h·Wvᵀ` | `Matrix::matmul` (weights kept in PyTorch `[out, in]` layout, so each output is a dot of two contiguous rows) |
+| `q, k, v = h·Wqᵀ, h·Wkᵀ, h·Wvᵀ` | one fused `Matrix::matmul` over the stacked `[Wq; Wk; Wv]` (weights kept in PyTorch `[out, in]` layout, so each output is a dot of two contiguous rows) |
 | rotate `q, k` by `pos · base^(-2i/d)` | `ops::Rope::apply`: HF "rotate_half" pairing `(i, i + d/2)`, θ = `rope_theta` = 100000 from config, cos/sin precomputed |
 | append `k, v` | `KvCache::write`, scattering into a `[kv_heads, capacity, head_dim]` layout |
 | `softmax(q·kᵀ / sqrt(d)) · v`, causal, GQA | `Model::attention`: query head `h` reads kv head `h / 3`; causality is implicit because position `p` only reads cache rows `0..=p` |
 | `x += o·Woᵀ` | `matmul` + `ops::add_assign` |
-| `x += W_down(silu(W_gate·h) ⊙ W_up·h)` | `matmul` ×3 + `ops::swiglu` |
+| `x += W_down(silu(W_gate·h) ⊙ W_up·h)` | fused `[W_gate; W_up]` matmul, `ops::swiglu`, `W_down` matmul |
 | final RMSNorm, `logits = h·Eᵀ` | tied embeddings (`tie_word_embeddings: true`), so `embed` doubles as the LM head; at generation time only the last row is computed |
 
 Layout decisions worth calling out:
@@ -113,6 +124,37 @@ All checked by `cargo test` against fixtures made by the dev-only scripts in
 | Greedy generation, 24 tokens × 3 prompts | `model.generate(do_sample=False)` | identical token ids |
 | Chat template rendering | `apply_chat_template` | byte-identical |
 
+Quantized models are checked too (`quantized_models_stay_close_to_reference`).
+Against fp32 transformers, top-1 agreement over the 60 fixture positions is
+56/60 for q8 and 45/60 for q4.
+
+### Perplexity (WikiText-2 test, quality cost of quantization)
+
+The text is tokenized once (303,415 tokens) and cut into non-overlapping
+512-token windows. The first 40 windows are scored, 20,440 predictions in
+total. `scripts/reference/perplexity_ref.py` runs the same protocol in
+transformers.
+
+| weights | bits/weight | weight MB | perplexity | vs fp32 |
+|---|---:|---:|---:|---:|
+| transformers fp32 (reference) | 32 | 538 | 22.4815 | |
+| Kiln f32 | 32 | 538 | **22.4815** | identical |
+| Kiln q8 (per-row int8) | 8.06 | 135 | 22.5308 | +0.2% |
+| Kiln q4, groups of 32 (+ q8 embedding) | ~5.3 avg | 88 | 28.5758 | +27% |
+| Kiln q4, groups of 64 (+ q8 embedding) | ~5.0 avg | 81 | 29.9041 | +33% |
+| Kiln q4, groups of 32, q4 embedding too | 4.5 | 76 | 31.7716 | +41% |
+
+Notes on the table:
+
+- **Kiln f32 vs transformers:** the perplexities agree to four decimals.
+- **q8:** essentially free.
+- **q4:** costly on a 135M-parameter model. Small models have little
+  redundancy to absorb 16-level weights, and the tied embedding / LM head is
+  the most sensitive tensor. That is why q4 keeps the embedding at q8, the
+  same choice llama.cpp makes for its output tensor.
+- **Group size:** 32 is the default. 64 saves 0.25 bits/weight but costs 1.3
+  perplexity points.
+
 The logits test tolerance is 1e-3: about 30× the measured error, which leaves room
 for the summation-order changes SIMD and threading will bring, while a real bug
 (wrong RoPE pairing, a missing norm) moves logits by more than 0.1.
@@ -136,44 +178,73 @@ python scripts/gen_unicode_tables.py   # \p{L} table for the pre-tokenizer
 - 21 byte values have no vocab entry. HF silently drops them (no `unk_token`, no
   `byte_fallback`), and Kiln matches that behavior.
 
-## Performance (milestone 3 baseline)
+## Performance
 
-AMD Ryzen 7 7800X3D (8 cores / 16 threads), Windows 11, `cargo build --release`,
-fp32 weights, greedy decoding:
+AMD Ryzen 7 7800X3D (8 cores / 16 threads, 96 MB L3), Windows 11, release build,
+`cargo bench --bench e2e`. Prefill is a 128-token prompt; decode is one token on
+a 128-token cache. All rows are in tok/s and were measured back to back in one
+session.
 
-| Threads | Prefill, 38-token prompt | Prefill, 420-token prompt | Decode |
-|---:|---:|---:|---:|
-| 1  | 102 tok/s | 95 tok/s  | 57.5 tok/s |
-| 4  | 332 tok/s | –         | 76.4 tok/s |
-| 8  | 451 tok/s | 461 tok/s | 70.0 tok/s |
-| 16 | 436 tok/s | 557 tok/s | 63.3 tok/s |
+| weights | threads | prefill | decode | weight MB | RSS during generation |
+|---|---:|---:|---:|---:|---:|
+| M3 baseline, f32 | 1 / 8 | 102 / 496 | 56 / 68 | 538 | |
+| f32 | 1 / 8 | 306 / 729 | 77 / 84 | 538 | 534 MB |
+| q8 | 1 / 8 | 295 / 715 | 143 / **346** | 135 | 150 MB |
+| q4 | 1 / 8 | 288 / 716 | 119 / 291 | 88 | 107 MB |
+| llama.cpp b11932, F16 | 8 | 1427 | 173 | 257 | |
+| llama.cpp b11932, Q8_0 | 8 | 1866 | 350 | 136 | |
+| llama.cpp b11932, Q4_0 (pure) | 8 | 3300 | 714 | 72 | |
 
-**Decode is memory-bandwidth bound already.** Every decoded token reads all 134.5M
-fp32 parameters, about 538 MB. At 57 tok/s on one thread that is ~31 GB/s; at
-4 threads it is ~41 GB/s, close to what dual-channel DDR5 sustains in practice. More
-threads don't help, and past 4 threads the rayon fan-out over small 576-row
-matrices costs more than it gains. The tied 49k × 576 LM head alone is 21% of that
-traffic. Shrinking the bytes per weight (int8/int4) is therefore the main decode
-lever, and it's why quantization is a milestone and not an afterthought.
+The full table, every optimization step with its numbers, the profile, and the
+dead ends are in [`docs/perf-log.md`](docs/perf-log.md). The short version:
 
-Prefill reuses each weight row across the whole batch, so it scales with cores.
-It is still far from compute peak, because the inner kernel is a scalar 8-accumulator
-dot product that LLVM auto-vectorizes.
+1. **Prefill (compute bound): 3× faster on 1 thread.** The changes were AVX2+FMA
+   kernels and a 4×3 register tile (12 accumulators plus 4 operand vectors fill
+   all 16 ymm registers) inside cache blocking: 64-token activation blocks stay
+   in L2 while each 4-row weight tile stays in L1. I first wrote the tile in
+   portable Rust. LLVM spilled the accumulator block and that version was 4×
+   *slower*, so the tile is written with `std::arch` intrinsics, and a runtime
+   CPU check falls back to tested scalar code.
+2. **Threading.** Decode used to get slower past 4 threads. Two changes fixed
+   that: running each forward pass on a rayon pool thread (so ~200 parallel
+   loops per token are cheap joins, not cross-thread injections), and sizing
+   tasks by work (≥ 64K multiply-adds). Projections that share an input
+   (QKV, gate+up) are fused at load time.
+3. **Decode (memory bound): quantization.** A decode step streams every weight
+   once. f32 decode tops out at ~48 GB/s of weights (90 tok/s at best).
+   q8 reads 4× fewer bytes and runs **4×** faster at the same ~47 GB/s, which
+   confirms the bandwidth model. q4 reads 1.5× fewer bytes again but is *not*
+   faster than q8, because at 88 MB the whole q4 model fits in this CPU's
+   96 MB L3. Decode stops being memory bound, and nibble unpacking plus
+   fork/join overhead set the speed. The q4 decode kernel is an integer dot
+   product against activations quantized to int8 per 32-block (`vpmaddubsw`,
+   as in llama.cpp). Making it faster meant removing a serial scalar chain and
+   an accumulator spill, both found by isolating the kernel.
+
+Against llama.cpp on the same machine: Kiln matches it on q8 decode (346 vs 350
+tok/s), because both hit the same memory wall. It trails by 2–2.5× on f16/q4
+decode and by 2.6–4.6× on prefill. llama.cpp uses f16 weights in place of f32,
+a persistent spin-barrier thread pool instead of fork/join, and integer GEMMs
+for quantized prefill. `docs/perf-log.md` explains each gap.
 
 ## Next steps
 
-1. **Performance (milestone 4).** Explicit AVX2/FMA (and NEON) dot kernels behind
-   `Matrix::matmul`; a register-blocked GEMM for prefill (tile tokens × rows so
-   activations stay in registers); fused QKV and gate/up projections; skip rayon
-   below a work threshold; a flame-graph-driven optimization log and llama.cpp
-   comparison with `criterion` benchmarks.
-2. **Quantization (milestone 5).** int8 per-channel and 4-bit group-quantized
-   `Matrix` variants (dequantize in the dot kernel), plus a perplexity table on
-   WikiText for fp32 / int8 / int4.
-3. **Server (milestone 6).** An OpenAI-compatible `/v1/chat/completions` with SSE
+1. **Server (milestone 6).** An OpenAI-compatible `/v1/chat/completions` with SSE
    streaming on `axum`, reusing `Session` prefix caching across requests.
+2. **Persistent workers with spin barriers** instead of per-matmul fork/join.
+   This is the main remaining decode cost once the weights fit in cache.
+3. **Integer GEMM for quantized prefill**, and f16/bf16 weights consumed
+   directly by the kernels, which halves f32 decode traffic with no accuracy
+   loss.
 
-Known limitations: the chat template supports the ChatML family (SmolLM2, Qwen2)
-rather than arbitrary Jinja; RoPE scaling supports `null` and `linear`, and anything
-else (llama3, yarn) is rejected rather than approximated; attention and the sampler
-allocate small scratch buffers per call.
+Known limitations:
+
+- **Chat templates:** Kiln supports the ChatML family (SmolLM2, Qwen2) rather
+  than arbitrary Jinja.
+- **RoPE scaling:** `null` and `linear` are supported. Anything else (llama3,
+  yarn) is rejected rather than approximated.
+- **SIMD:** x86-64 AVX2 only. Other CPUs, ARM/NEON included, run the scalar
+  fallback.
+- **Q4 numerics differ by path:** decode quantizes activations to int8, while
+  prefill dequantizes weights to f32. The drift between the two paths is
+  bounded in the tests and costs no top-1 accuracy on the fixtures.

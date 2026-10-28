@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use crate::config::Config;
 use crate::kv_cache::{KvCache, LayerView};
 use crate::ops::{Rope, add_assign, axpy, rms_norm, softmax, swiglu};
-use crate::tensor::{Matrix, dot};
+use crate::tensor::{Matrix, Quant, dot};
 use crate::tokenizer::TokenId;
 use crate::weights::WeightFile;
 
@@ -33,17 +33,20 @@ pub struct Model {
     rope: Rope,
 }
 
+/// Projections that read the same input are fused into one matrix at load
+/// time (rows stacked): one matmul, one parallel region and one pass over the
+/// input instead of three (Q, K, V) or two (gate, up).
 struct Layer {
     attn_norm: Vec<f32>,
-    wq: Matrix, // [heads·head_dim, hidden]
-    wk: Matrix, // [kv_heads·head_dim, hidden]
-    wv: Matrix, // [kv_heads·head_dim, hidden]
-    wo: Matrix, // [hidden, heads·head_dim]
+    wqkv: Matrix, // [(heads + 2·kv_heads)·head_dim, hidden]: Q rows, then K, then V
+    wo: Matrix,   // [hidden, heads·head_dim]
     mlp_norm: Vec<f32>,
-    w_gate: Matrix, // [ffn, hidden]
-    w_up: Matrix,   // [ffn, hidden]
-    w_down: Matrix, // [hidden, ffn]
+    w_gate_up: Matrix, // [2·ffn, hidden]: gate rows, then up
+    w_down: Matrix,    // [hidden, ffn]
 }
+
+/// Minimum multiply-adds per parallel attention task.
+const ATTN_MIN_TASK: usize = 1 << 15;
 
 /// Which positions to compute logits for. Generation only needs the last one,
 /// which skips a `[vocab, hidden]` matmul per prompt token during prefill.
@@ -54,8 +57,15 @@ pub enum Logits {
 }
 
 impl Model {
-    /// Load `config.json` and `model.safetensors` from a model directory.
+    /// Load `config.json` and `model.safetensors` from a model directory, in f32.
     pub fn load(dir: impl AsRef<Path>) -> Result<Self> {
+        Self::load_quantized(dir, Quant::F32)
+    }
+
+    /// Load and store every weight matrix (embeddings included) in `quant`
+    /// format, quantizing from the bf16 checkpoint tensor by tensor. Norm
+    /// weights stay f32: they are tiny and multiply every activation.
+    pub fn load_quantized(dir: impl AsRef<Path>, quant: Quant) -> Result<Self> {
         let dir = dir.as_ref();
         let config = Config::from_file(dir.join("config.json"))?;
         let file = WeightFile::open(dir.join("model.safetensors"))?;
@@ -69,29 +79,40 @@ impl Model {
         let q_dim = config.num_attention_heads * config.head_dim();
         let kv_dim = config.num_kv_heads() * config.head_dim();
 
-        // Layers are independent, so widen bf16 -> f32 for them in parallel.
+        // Layers are independent, so widen/quantize them in parallel.
         let layers = (0..config.num_hidden_layers)
             .into_par_iter()
             .map(|i| -> Result<Layer> {
-                let p = format!("model.layers.{i}");
+                let p = |name: &str| format!("model.layers.{i}.{name}.weight");
+                let (q, k, v) = (
+                    p("self_attn.q_proj"),
+                    p("self_attn.k_proj"),
+                    p("self_attn.v_proj"),
+                );
+                let (gate, up) = (p("mlp.gate_proj"), p("mlp.up_proj"));
                 Ok(Layer {
-                    attn_norm: t.load(&format!("{p}.input_layernorm.weight"), &[d])?,
-                    wq: t.load_matrix(&format!("{p}.self_attn.q_proj.weight"), q_dim, d)?,
-                    wk: t.load_matrix(&format!("{p}.self_attn.k_proj.weight"), kv_dim, d)?,
-                    wv: t.load_matrix(&format!("{p}.self_attn.v_proj.weight"), kv_dim, d)?,
-                    wo: t.load_matrix(&format!("{p}.self_attn.o_proj.weight"), d, q_dim)?,
-                    mlp_norm: t.load(&format!("{p}.post_attention_layernorm.weight"), &[d])?,
-                    w_gate: t.load_matrix(&format!("{p}.mlp.gate_proj.weight"), ffn, d)?,
-                    w_up: t.load_matrix(&format!("{p}.mlp.up_proj.weight"), ffn, d)?,
-                    w_down: t.load_matrix(&format!("{p}.mlp.down_proj.weight"), d, ffn)?,
+                    attn_norm: t.load(&p("input_layernorm"), &[d])?,
+                    wqkv: t.load_matrix(&[(&q, q_dim), (&k, kv_dim), (&v, kv_dim)], d, quant)?,
+                    wo: t.load_matrix(&[(&p("self_attn.o_proj"), d)], q_dim, quant)?,
+                    mlp_norm: t.load(&p("post_attention_layernorm"), &[d])?,
+                    w_gate_up: t.load_matrix(&[(&gate, ffn), (&up, ffn)], d, quant)?,
+                    w_down: t.load_matrix(&[(&p("mlp.down_proj"), d)], ffn, quant)?,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
 
+        // The embedding table doubles as the output projection, where 4-bit
+        // error lands directly on the logits: under Q4 it is kept at Q8 (as
+        // llama.cpp keeps its output tensor at higher precision). Measured on
+        // WikiText-2: perplexity 31.8 with a Q4 embedding vs 28.6 with Q8.
+        let embed_quant = match quant {
+            Quant::Q4 { .. } => Quant::Q8,
+            other => other,
+        };
         let lm_head = if config.tie_word_embeddings {
             None
         } else {
-            Some(t.load_matrix("lm_head.weight", vocab, d)?)
+            Some(t.load_matrix(&[("lm_head.weight", vocab)], d, embed_quant)?)
         };
 
         let rope = Rope::new(
@@ -101,7 +122,7 @@ impl Model {
             config.max_position_embeddings,
         );
         Ok(Self {
-            embed: t.load_matrix("model.embed_tokens.weight", vocab, d)?,
+            embed: t.load_matrix(&[("model.embed_tokens.weight", vocab)], d, embed_quant)?,
             final_norm: t.load("model.norm.weight", &[d])?,
             layers,
             lm_head,
@@ -120,6 +141,30 @@ impl Model {
         KvCache::new(&self.config, capacity.min(self.rope.max_positions()))
     }
 
+    /// Weight storage format of the transformer layers.
+    pub fn quant(&self) -> Quant {
+        self.layers[0].wqkv.quant()
+    }
+
+    /// Bytes of weights, i.e. what one decode step has to stream from memory.
+    pub fn weight_bytes(&self) -> usize {
+        let layers: usize = self
+            .layers
+            .iter()
+            .map(|l| {
+                l.wqkv.bytes()
+                    + l.wo.bytes()
+                    + l.w_gate_up.bytes()
+                    + l.w_down.bytes()
+                    + 4 * (l.attn_norm.len() + l.mlp_norm.len())
+            })
+            .sum();
+        layers
+            + self.embed.bytes()
+            + self.lm_head.as_ref().map_or(0, Matrix::bytes)
+            + 4 * self.final_norm.len()
+    }
+
     fn lm_head(&self) -> &Matrix {
         self.lm_head.as_ref().unwrap_or(&self.embed)
     }
@@ -135,6 +180,19 @@ impl Model {
         cache: &mut KvCache,
         logits: Logits,
     ) -> Result<Vec<f32>> {
+        // Hop onto a pool thread once per forward pass. Called from outside
+        // the pool, each of the ~200 parallel loops in a decode step would
+        // inject a job and park the caller on an OS event; from inside, they
+        // are cheap fork-joins through the work-stealing deques.
+        rayon::scope(|_| self.forward_in_pool(tokens, cache, logits))
+    }
+
+    fn forward_in_pool(
+        &self,
+        tokens: &[TokenId],
+        cache: &mut KvCache,
+        logits: Logits,
+    ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         let (n, d) = (tokens.len(), cfg.hidden_size);
         let start = cache.len();
@@ -145,29 +203,29 @@ impl Model {
             cache.capacity()
         );
 
-        let mut x = Vec::with_capacity(n * d);
-        for &tok in tokens {
+        let mut x = vec![0.0; n * d];
+        for (&tok, row) in tokens.iter().zip(x.chunks_exact_mut(d)) {
             ensure!(
                 (tok as usize) < cfg.vocab_size,
                 "token id {tok} out of range"
             );
-            x.extend_from_slice(self.embed.row(tok as usize));
+            self.embed.row_into(tok as usize, row);
         }
 
         let mut buf = Buffers::new(cfg, n);
         for (l, layer) in self.layers.iter().enumerate() {
             // --- self-attention block (pre-norm, residual) ---
             rms_norm(&x, &layer.attn_norm, cfg.rms_norm_eps, &mut buf.normed);
-            layer.wq.matmul(&buf.normed, &mut buf.q);
-            layer.wk.matmul(&buf.normed, &mut buf.k);
-            layer.wv.matmul(&buf.normed, &mut buf.v);
-            let q_dim = buf.q.len() / n;
-            let kv_dim = buf.k.len() / n;
-            for t in 0..n {
-                self.rope
-                    .apply(&mut buf.q[t * q_dim..(t + 1) * q_dim], start + t);
-                self.rope
-                    .apply(&mut buf.k[t * kv_dim..(t + 1) * kv_dim], start + t);
+            layer.wqkv.matmul(&buf.normed, &mut buf.qkv);
+            let (q_dim, kv_dim) = (buf.q.len() / n, buf.k.len() / n);
+            for (t, row) in buf.qkv.chunks_exact_mut(q_dim + 2 * kv_dim).enumerate() {
+                let (q, kv) = row.split_at_mut(q_dim);
+                let (k, v) = kv.split_at_mut(kv_dim);
+                self.rope.apply(q, start + t);
+                self.rope.apply(k, start + t);
+                buf.q[t * q_dim..(t + 1) * q_dim].copy_from_slice(q);
+                buf.k[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(k);
+                buf.v[t * kv_dim..(t + 1) * kv_dim].copy_from_slice(v);
             }
             cache.write(l, start, &buf.k, &buf.v);
             self.attention(&buf.q, cache.layer(l), start, &mut buf.attn);
@@ -176,9 +234,17 @@ impl Model {
 
             // --- SwiGLU MLP block: down(silu(gate(x)) * up(x)) ---
             rms_norm(&x, &layer.mlp_norm, cfg.rms_norm_eps, &mut buf.normed);
-            layer.w_gate.matmul(&buf.normed, &mut buf.gate);
-            layer.w_up.matmul(&buf.normed, &mut buf.up);
-            swiglu(&mut buf.gate, &buf.up);
+            layer.w_gate_up.matmul(&buf.normed, &mut buf.gate_up);
+            let ffn = cfg.intermediate_size;
+            for (row, out) in buf
+                .gate_up
+                .chunks_exact_mut(2 * ffn)
+                .zip(buf.gate.chunks_exact_mut(ffn))
+            {
+                let (gate, up) = row.split_at_mut(ffn);
+                swiglu(gate, up);
+                out.copy_from_slice(gate);
+            }
             layer.w_down.matmul(&buf.gate, &mut buf.proj);
             add_assign(&mut x, &buf.proj);
         }
@@ -211,37 +277,46 @@ impl Model {
         let group = heads / cfg.num_kv_heads();
         let scale = 1.0 / (hd as f32).sqrt();
 
-        // One task per (token, head) pair; `i = t * heads + h` matches the
-        // [n, heads, head_dim] layout of both `q` and `out`.
-        out.par_chunks_mut(hd).enumerate().for_each(|(i, o)| {
-            let (t, h) = (i / heads, i % heads);
-            let visible = start + t + 1;
-            let qh = &q[i * hd..(i + 1) * hd];
-            let keys = cache.keys(h / group, visible);
-            let values = cache.values(h / group, visible);
+        // One item per (token, head) pair; `i = t * heads + h` matches the
+        // [n, heads, head_dim] layout of both `q` and `out`. Items are batched
+        // so each task does at least ATTN_MIN_TASK multiply-adds: in decode at
+        // short context, all 9 heads together are only a few microseconds.
+        let per_item = 2 * (start + q.len() / (heads * hd)) * hd;
+        let min_items = ATTN_MIN_TASK.div_ceil(per_item);
+        out.par_chunks_mut(hd)
+            .enumerate()
+            .with_min_len(min_items)
+            .for_each(|(i, o)| {
+                let (t, h) = (i / heads, i % heads);
+                let visible = start + t + 1;
+                let qh = &q[i * hd..(i + 1) * hd];
+                let keys = cache.keys(h / group, visible);
+                let values = cache.values(h / group, visible);
 
-            // Scaled dot-product scores; the 1/sqrt(d) keeps their variance
-            // ~1 so softmax does not saturate as head_dim grows.
-            let mut scores: Vec<f32> = keys.chunks_exact(hd).map(|k| dot(qh, k) * scale).collect();
-            softmax(&mut scores);
-            o.fill(0.0);
-            for (&w, v) in scores.iter().zip(values.chunks_exact(hd)) {
-                axpy(o, w, v);
-            }
-        });
+                // Scaled dot-product scores; the 1/sqrt(d) keeps their variance
+                // ~1 so softmax does not saturate as head_dim grows.
+                let mut scores: Vec<f32> =
+                    keys.chunks_exact(hd).map(|k| dot(qh, k) * scale).collect();
+                softmax(&mut scores);
+                o.fill(0.0);
+                for (&w, v) in scores.iter().zip(values.chunks_exact(hd)) {
+                    axpy(o, w, v);
+                }
+            });
     }
 }
 
 /// Per-forward scratch activations, allocated once and reused by every layer.
 struct Buffers {
     normed: Vec<f32>,
+    qkv: Vec<f32>,
     q: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
     attn: Vec<f32>,
     proj: Vec<f32>,
+    gate_up: Vec<f32>,
     gate: Vec<f32>,
-    up: Vec<f32>,
 }
 
 impl Buffers {
@@ -251,13 +326,14 @@ impl Buffers {
         let zeros = |len: usize| vec![0.0; n * len];
         Self {
             normed: zeros(cfg.hidden_size),
+            qkv: zeros(q_dim + 2 * kv_dim),
             q: zeros(q_dim),
             k: zeros(kv_dim),
             v: zeros(kv_dim),
             attn: zeros(q_dim),
             proj: zeros(cfg.hidden_size),
+            gate_up: zeros(2 * cfg.intermediate_size),
             gate: zeros(cfg.intermediate_size),
-            up: zeros(cfg.intermediate_size),
         }
     }
 }

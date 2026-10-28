@@ -24,3 +24,14 @@ lto = "thin"
 # The test suite runs a 135M-parameter model; an unoptimized build makes it crawl.
 [profile.test]
 opt-level = 3
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "matmul"
+harness = false
+
+[[bench]]
+name = "e2e"
+harness = false

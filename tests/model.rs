@@ -5,7 +5,7 @@ mod common;
 
 use kiln::chat::{ChatTemplate, Message, Role};
 use kiln::generate::{Session, StopReason};
-use kiln::model::Logits;
+use kiln::model::{Logits, Model};
 use kiln::sampler::{Sampler, SamplingParams};
 use serde::Deserialize;
 
@@ -209,4 +209,45 @@ fn chat_template_matches_apply_chat_template() {
         user("Name a color."),
     ];
     assert_eq!(template.render(&convo, true), fx.chat_template.with_system);
+}
+
+/// Quantized weights trade accuracy for bytes; check the trade is the
+/// expected size. Measures top-1 agreement with fp32 transformers through both
+/// the prefill path (dequantized f32 tiles) and the decode path (Q4 dots
+/// against int8-quantized activations), and the logit drift between them.
+#[test]
+fn quantized_models_stay_close_to_reference() {
+    let fx = fixture();
+    for (quant, min_top1) in [("q8", 0.9), ("q4", 0.7)] {
+        let model = Model::load_quantized(common::model_dir(), quant.parse().unwrap()).unwrap();
+        let vocab = model.config().vocab_size;
+        let (mut prefill_agree, mut decode_agree, mut total) = (0, 0, 0);
+        let mut drift = 0.0f32;
+        for case in &fx.cases {
+            let mut cache = model.new_cache(case.ids.len());
+            let full = model.forward(&case.ids, &mut cache, Logits::All).unwrap();
+            let mut cache = model.new_cache(case.ids.len());
+            for (pos, &id) in case.ids.iter().enumerate() {
+                let step = model.forward(&[id], &mut cache, Logits::Last).unwrap();
+                let row = &full[pos * vocab..(pos + 1) * vocab];
+                let want = case.topk_ids[pos][0];
+                prefill_agree += usize::from(argmax(row) == want);
+                decode_agree += usize::from(argmax(&step) == want);
+                total += 1;
+                for (a, b) in step.iter().zip(row) {
+                    drift = drift.max((a - b).abs());
+                }
+            }
+        }
+        eprintln!(
+            "{quant}: top-1 vs fp32 transformers: prefill {prefill_agree}/{total}, decode {decode_agree}/{total}; decode-prefill max logit diff {drift:.3}"
+        );
+        for agree in [prefill_agree, decode_agree] {
+            assert!(
+                agree as f32 >= min_top1 * total as f32,
+                "{quant}: {agree}/{total}"
+            );
+        }
+        assert!(drift < 3.0, "{quant}: decode drifts {drift} from prefill");
+    }
 }

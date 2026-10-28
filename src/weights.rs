@@ -15,7 +15,7 @@ use half::{bf16, f16};
 use memmap2::Mmap;
 use safetensors::{Dtype, SafeTensors};
 
-use crate::tensor::Matrix;
+use crate::tensor::{Matrix, Quant};
 
 pub struct WeightFile {
     mmap: Mmap,
@@ -82,7 +82,21 @@ impl Tensors<'_> {
         })
     }
 
-    pub fn load_matrix(&self, name: &str, rows: usize, cols: usize) -> Result<Matrix> {
-        Ok(Matrix::new(self.load(name, &[rows, cols])?, rows, cols))
+    /// Load one or more `[rows_i, cols]` tensors, stack their rows into a
+    /// single matrix (fusing projections that share an input), and store it
+    /// in `quant` format.
+    pub fn load_matrix(
+        &self,
+        parts: &[(&str, usize)],
+        cols: usize,
+        quant: Quant,
+    ) -> Result<Matrix> {
+        let rows = parts.iter().map(|&(_, r)| r).sum();
+        let mut data = Vec::with_capacity(rows * cols);
+        for &(name, r) in parts {
+            data.extend(self.load(name, &[r, cols])?);
+        }
+        Matrix::quantized(data, rows, cols, quant)
+            .with_context(|| format!("quantizing {}", parts[0].0))
     }
 }
