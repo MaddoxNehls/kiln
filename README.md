@@ -6,10 +6,10 @@ on the CPU, with no ML or tensor framework: the tokenizer, the transformer math,
 the KV cache and the sampler are all implemented here and checked against
 Hugging Face `tokenizers`/`transformers`.
 
-> Status: milestones 1-5 of [`docs/spec.md`](docs/spec.md) are done: the
+> Status: all six milestones of [`docs/spec.md`](docs/spec.md) are done: the
 > tokenizer, the fp32 forward pass, the KV cache with sampling and a streaming
-> CLI, AVX2 kernels with a performance log, and int8/int4 quantization with a
-> perplexity table. The HTTP server (milestone 6) is next.
+> CLI, AVX2 kernels with a performance log, int8/int4 quantization with a
+> perplexity table, and an OpenAI-compatible HTTP server.
 
 ```console
 $ kiln generate --quant q8 --threads 8 --prompt "Explain in two sentences why the sky is blue." --max-tokens 100 --seed 42
@@ -30,6 +30,7 @@ cargo build --release
 ./target/release/kiln chat --quant q8     # multi-turn; /reset clears history
 scripts/download-wikitext.sh              # WikiText-2 test split into data/
 ./target/release/kiln perplexity --quant q4
+./target/release/kiln serve --quant q8 --threads 8   # OpenAI-compatible API on 127.0.0.1:8080
 cargo test                                # needs the downloaded model
 cargo bench --bench e2e                   # KILN_QUANT=q8|q4, RAYON_NUM_THREADS=N
 ```
@@ -41,6 +42,32 @@ Sampling flags (shared by `generate` and `chat`): `--temperature` (0 = greedy),
 `--system`, `--ctx` (KV cache size), and `--raw` on `generate` to skip the chat
 template. On this 8-core CPU, `--threads 8` beats the default of 16 logical
 threads for decode.
+
+### Serving
+
+`kiln serve` exposes `POST /v1/chat/completions` (plain JSON or SSE with
+`"stream": true`) and `GET /v1/models`, so any OpenAI client works:
+
+```python
+from openai import OpenAI
+client = OpenAI(base_url="http://127.0.0.1:8080/v1", api_key="unused")
+client.chat.completions.create(model="smollm2-135m-instruct",
+                               messages=[{"role": "user", "content": "Hi"}])
+```
+
+Requests run one at a time against a single shared `Session`: the engine
+already saturates the cores through rayon, so concurrency would only interleave
+work. Sharing one session also gives chat clients prefix caching across
+requests, since each turn re-sends the whole conversation. The server logs it:
+
+```
+[prompt 40 tok, 0 reused from cache | prefill 622.0 tok/s | decode 7 tok at 229.1 tok/s]
+[prompt 62 tok, 47 reused from cache | prefill 601.5 tok/s | decode 9 tok at 275.6 tok/s]
+```
+
+`tests/server.rs` starts the real binary and checks the JSON, streaming and
+error responses over HTTP. It was also checked with the official `openai`
+Python client.
 
 ## Architecture
 
@@ -79,7 +106,7 @@ threads for decode.
 **One crate, library + binary.** Every module is a stage of a single pipeline with
 one consumer, so a workspace would add manifests without adding any boundary that
 pays off yet. `src/lib.rs` is the engine and `src/main.rs` is a thin CLI, so the
-planned server (milestone 6) becomes a second binary or a feature on the same library.
+HTTP server (`src/server.rs`, axum) is just another front end on the same library.
 
 ## How the forward pass maps to code
 
@@ -229,13 +256,14 @@ for quantized prefill. `docs/perf-log.md` explains each gap.
 
 ## Next steps
 
-1. **Server (milestone 6).** An OpenAI-compatible `/v1/chat/completions` with SSE
-   streaming on `axum`, reusing `Session` prefix caching across requests.
-2. **Persistent workers with spin barriers** instead of per-matmul fork/join.
+1. **Persistent workers with spin barriers** instead of per-matmul fork/join.
    This is the main remaining decode cost once the weights fit in cache.
-3. **Integer GEMM for quantized prefill**, and f16/bf16 weights consumed
+2. **Integer GEMM for quantized prefill**, and f16/bf16 weights consumed
    directly by the kernels, which halves f32 decode traffic with no accuracy
    loss.
+
+3. **Multiple sessions in the server**, keyed by conversation prefix, so
+   interleaved clients don't evict each other's cache.
 
 Known limitations:
 

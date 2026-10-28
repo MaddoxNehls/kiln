@@ -1,3 +1,5 @@
+mod server;
+
 use std::io::{self, BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -40,6 +42,15 @@ enum Command {
         model: ModelArgs,
         #[command(flatten)]
         args: GenerationArgs,
+    },
+    /// Serve an OpenAI-compatible API (`/v1/chat/completions`, `/v1/models`).
+    Serve {
+        #[command(flatten)]
+        model: ModelArgs,
+        #[command(flatten)]
+        args: GenerationArgs,
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: std::net::SocketAddr,
     },
     /// Perplexity of a text file (e.g. WikiText-2 test, see scripts/download-wikitext.sh).
     Perplexity {
@@ -246,6 +257,21 @@ fn main() -> Result<()> {
         Command::Chat { model, args } => {
             let engine = Engine::load(&model)?;
             chat(&engine, &args)?;
+        }
+        Command::Serve { model, args, addr } => {
+            let engine = Engine::load(&model)?;
+            let model_id = model
+                .model
+                .file_name()
+                .map_or_else(|| "kiln".into(), |n| n.to_string_lossy().into_owned());
+            server::serve(
+                engine,
+                addr,
+                args.ctx,
+                args.sampling(),
+                args.max_tokens,
+                model_id,
+            )?;
         }
         Command::Perplexity {
             model,
